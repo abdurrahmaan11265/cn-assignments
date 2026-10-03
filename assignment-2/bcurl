@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""bcurl -- a BHTTP/1 client.
+
+    ./bcurl -v localhost:9000/index.html
+
+Builds the binary request frame, reads the response, writes the body to
+stdout. -v hexdumps every frame. Exits non-zero on 4xx and 5xx.
+
+One connection. Never a second one -- not for a redirect, not for a retry.
+
+This file deliberately shares no code with bserve. It is written from
+SPEC.md, because a client that only works against its own server is an
+implementation, not a protocol.
+"""
+
+import socket
+import sys
+
+PREFACE     = b"BHTTP\x01\r\n"
+HEADERS     = 0x01
+DATA        = 0x02
+END_MESSAGE = 0x01
+
+STATIC = [":method", ":path", ":status", "host", "content-length",
+          "content-type", "date", "server", "connection", "user-agent"]
+
+
+# ------------------------------------------------------------ the codec ----
+
+def put_string(text):
+    raw = text.encode()
+    if len(raw) < 0xFF:
+        return bytes([len(raw)]) + raw
+    return b"\xff" + len(raw).to_bytes(2, "big") + raw
+
+
+def encode_headers(fields):
+    out = bytearray()
+    for name, value in fields:
+        if name in STATIC:
+            out.append(0x80 | (STATIC.index(name) + 1))
+        else:
+            raw = name.encode()
+            out.append(len(raw))
+            out += raw
+        out += put_string(value)
+    return bytes(out)
+
+
+def decode_headers(payload):
+    fields = {}
+    i = 0
+    while i < len(payload):
+        first = payload[i]
+        i += 1
+        if first & 0x80:
+            index = (first & 0x7F) - 1
+            if not 0 <= index < len(STATIC):
+                raise ValueError("static index %d is not in the table" % (index + 1))
+            name = STATIC[index]
+        else:
+            name = payload[i:i + first].decode("utf-8", "replace")
+            i += first
+        length = payload[i]
+        i += 1
+        if length == 0xFF:
+            length = int.from_bytes(payload[i:i + 2], "big")
+            i += 2
+        fields[name] = payload[i:i + length].decode("utf-8", "replace")
+        i += length
+    return fields
+
+
+def build_frame(kind, flags, request_id, payload=b""):
+    return (len(payload).to_bytes(3, "big")
+            + bytes([kind, flags])
+            + request_id.to_bytes(2, "big")
+            + b"\x00"
+            + payload)
+
+
+def recv_exactly(sock, count):
+    buf = b""
+    while len(buf) < count:
+        chunk = sock.recv(count - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+
+def read_frame(sock):
+    head = recv_exactly(sock, 8)
+    if head is None:
+        return None
+    length = int.from_bytes(head[0:3], "big")
+    payload = recv_exactly(sock, length) if length else b""
+    if payload is None:
+        raise ValueError("frame header promised %d bytes that never came" % length)
+    return head[3], head[4], int.from_bytes(head[5:7], "big"), payload
+
+
+# ------------------------------------------------------------- verbose -----
+
+def hexdump(label, raw):
+    print("%s  (%d bytes)" % (label, len(raw)), file=sys.stderr)
+    for offset in range(0, len(raw), 16):
+        row = raw[offset:offset + 16]
+        hexpart = " ".join("%02x" % b for b in row)
+        text = "".join(chr(b) if 32 <= b < 127 else "." for b in row)
+        print("  %04x  %-47s  %s" % (offset, hexpart, text), file=sys.stderr)
+
+
+def parse_url(url):
+    """'localhost:9000/index.html' -> ('localhost', 9000, '/index.html')"""
+    for prefix in ("bhttp://", "http://"):
+        if url.startswith(prefix):
+            url = url[len(prefix):]
+    authority, slash, path = url.partition("/")
+    host, colon, port = authority.partition(":")
+    return host, int(port) if colon else 9000, (slash + path) if slash else "/"
+
+
+# -------------------------------------------------------------- the run ----
+
+def main(argv):
+    args = [a for a in argv[1:] if not a.startswith("-")]
+    verbose = "-v" in argv
+    probe = "--probe-unknown" in argv       # demonstrates the skip-unknown rule
+    if len(args) != 1:
+        sys.exit("usage: ./bcurl [-v] [--probe-unknown] host:port/path")
+    host, port, path = parse_url(args[0])
+
+    sock = socket.create_connection((host, port))    # the only connection
+    sock.sendall(PREFACE)
+    if verbose:
+        hexdump("> preface", PREFACE)
+
+    if probe:
+        # A frame type from no version of this protocol. A conforming
+        # receiver reads its length from the fixed header and steps over it.
+        junk = build_frame(0x42, 0x00, 0, b"this is not a frame you know")
+        sock.sendall(junk)
+        if verbose:
+            hexdump("> unknown frame (type 0x42)", junk)
+
+    request = build_frame(HEADERS, END_MESSAGE, 1, encode_headers([
+        (":method", "GET"),
+        (":path", path),
+        ("host", "%s:%d" % (host, port)),
+        ("user-agent", "bcurl/1"),
+    ]))
+    sock.sendall(request)
+    if verbose:
+        hexdump("> request", request)
+
+    status = 0
+    body = b""
+    while True:
+        frame = read_frame(sock)
+        if frame is None:
+            break
+        kind, flags, request_id, payload = frame
+        if verbose:
+            hexdump("< frame type 0x%02x flags 0x%02x id %d"
+                    % (kind, flags, request_id), build_frame(kind, flags,
+                                                             request_id, payload))
+        if kind == HEADERS:
+            fields = decode_headers(payload)
+            status = int(fields.get(":status", 0))
+            if verbose:
+                for name, value in fields.items():
+                    print("  %s: %s" % (name, value), file=sys.stderr)
+        elif kind == DATA:
+            body += payload
+        else:
+            if verbose:
+                print("  skipped unknown frame type 0x%02x" % kind, file=sys.stderr)
+        if flags & END_MESSAGE:
+            break
+
+    sock.close()
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+    if status >= 400:
+        print("bcurl: server said %d" % status, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
